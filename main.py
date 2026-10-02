@@ -1,28 +1,23 @@
 """
-QuantVexa Python Backend — Single-file server
-=================================================
+QuantVexa Python Backend — Single-file server (single port)
+=============================================================
 
-Runs 3 Flask services + 2 background threads in one process:
-  🕯️ Candle Service   :PORT_CANDLE   (default 9001)
-  🤖 Telegram Service :PORT_TELEGRAM  (default 9002)
-  📈 Signals Service  :PORT_SIGNALS   (default 9003)
-  🌐 Main App         :PORT           (default 8080, Railway uses this)
+Runs ALL services on ONE port ($PORT) so Railway can expose them publicly:
+  🕯️ /candle/*       — symbols + OHLCV candles
+  🤖 /telegram/*     — send messages + notify subscriptions
+  📈 /signals/*      — list signals + bot status + bot control
+  🌐 /health         — unified health check
+  🌐 /               — service info
 
-Background threads:
+Background threads (no HTTP port needed):
   - Telegram polling (forwards user messages to Node.js)
-  - Signals generator (creates a new signal every SIGNAL_INTERVAL_SEC,
+  - Signals generator (creates signals every SIGNAL_INTERVAL_SEC,
     pushes to Node.js via /internal/signals/new)
 
-All config, services, threads, and the Node.js bridge client live in
-THIS file so a single edit covers everything.
+Single-port design: Railway (and Docker) only expose ONE port publicly.
+The old 3-port design (9001/9002/9003) was unreachable from other containers.
 
-Compatibility:
-  - Mirrors the admin dashboard's data shape (Basic/Pro/Elite plans,
-    Binance/TRC20/BEP20 payments, Strong/Medium/Pro strategies,
-    QUOTEX/BINOLLA platforms)
-  - Mirrors the Node.js backend's internal-webhook contract
-    (/internal/signals/new, /internal/signals/:id/resolve,
-     /internal/support/message, /internal/bot/status)
+Compatibility: mirrors Node.js backend (Backend-Server) + admin dashboard (DBQDBDFB).
 """
 
 import os
@@ -40,7 +35,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from flask import Flask, jsonify, request
-from werkzeug.serving import make_server, run_simple
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -63,9 +57,6 @@ def _list(name, default):
 @dataclass
 class Config:
     port: int = _int("PORT", 8080)
-    port_candle: int = _int("PORT_CANDLE", 9001)
-    port_telegram: int = _int("PORT_TELEGRAM", 9002)
-    port_signals: int = _int("PORT_SIGNALS", 9003)
     telegram_bot_token: str = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     node_backend_url: str = os.environ.get("NODE_BACKEND_URL", "http://localhost:8080").rstrip("/")
     internal_secret: str = os.environ.get("INTERNAL_SECRET", "dev-internal-secret")
@@ -106,7 +97,6 @@ def _emit(level, msg, meta):
     sys.stdout.flush()
 
 
-def log_debug(msg, **meta): _emit("DEBUG", msg, meta or None)
 def log_info(msg, **meta):  _emit("INFO",  msg, meta or None)
 def log_warn(msg, **meta):  _emit("WARN",  msg, meta or None)
 def log_error(msg, **meta): _emit("ERROR", msg, meta or None)
@@ -125,12 +115,11 @@ def fail_response(code="INTERNAL", message="Something went wrong", status=500, d
     return jsonify({"ok": False, "error": err}), status
 
 
-def now_ms(): return int(time.time() * 1000)
 def now_sec(): return int(time.time())
 
 
 # ============================================================================
-# NODE BRIDGE — HTTP client to push events to Node.js backend
+# NODE BRIDGE — push events to Node.js backend
 # ============================================================================
 NODE_HEADERS = {
     "Content-Type": "application/json",
@@ -138,8 +127,7 @@ NODE_HEADERS = {
 }
 
 
-def node_push(path: str, payload: dict) -> dict | None:
-    """POST to Node.js /internal/* endpoint. Returns response data or None."""
+def node_push(path, payload):
     try:
         r = requests.post(f"{config.node_backend_url}{path}", json=payload, headers=NODE_HEADERS, timeout=5)
         if r.ok:
@@ -150,24 +138,24 @@ def node_push(path: str, payload: dict) -> dict | None:
     return None
 
 
-def node_push_signal_new(signal: dict):
+def node_push_signal_new(signal):
     return node_push("/internal/signals/new", signal)
 
 
-def node_push_signal_resolve(signal_id: str, result: str, profit: float):
+def node_push_signal_resolve(signal_id, result, profit):
     return node_push(f"/internal/signals/{signal_id}/resolve", {"result": result, "profit": profit})
 
 
-def node_push_support_message(tg_id: str, text: str):
+def node_push_support_message(tg_id, text):
     return node_push("/internal/support/message", {"tg_id": str(tg_id), "text": text})
 
 
-def node_push_bot_status(status: dict):
+def node_push_bot_status(status):
     return node_push("/internal/bot/status", status)
 
 
 # ============================================================================
-# 🕯️ CANDLE SERVICE
+# 🕯️ CANDLE DATA — symbols + OHLCV generation
 # ============================================================================
 SYMBOLS = [
     {"symbol": "BRLUSD-OTC", "price": 0.1985, "change": 0.42},
@@ -236,34 +224,8 @@ def _gen_candles(symbol, timeframe, limit):
     return candles
 
 
-def create_candle_app():
-    app = Flask("candle")
-
-    @app.route("/health")
-    def health():
-        return ok_response({"service": "candle", "status": "running", "symbols": len(SYMBOLS)})
-
-    @app.route("/symbols")
-    def symbols():
-        return ok_response(SYMBOLS)
-
-    @app.route("/candles/<path:symbol>")
-    def candles(symbol):
-        timeframe = request.args.get("timeframe", "1m")
-        if timeframe not in TIMEFRAME_SECONDS:
-            return fail_response("BAD_TIMEFRAME", f"Unsupported timeframe: {timeframe}", 400)
-        try: limit = int(request.args.get("limit", config.candle_default_limit))
-        except ValueError: return fail_response("BAD_LIMIT", "limit must be an integer", 400)
-        limit = max(1, min(limit, 1000))
-        candles_data = _gen_candles(symbol, timeframe, limit)
-        log_info("candles served", symbol=symbol, timeframe=timeframe, count=len(candles_data))
-        return ok_response({"symbol": symbol, "timeframe": timeframe, "candles": candles_data})
-
-    return app
-
-
 # ============================================================================
-# 🤖 TELEGRAM BOT SERVICE
+# 🤖 TELEGRAM BOT
 # ============================================================================
 TELEGRAM_API = f"https://api.telegram.org/bot{config.telegram_bot_token}" if config.telegram_bot_token else ""
 _tg_polling_thread = None
@@ -333,53 +295,8 @@ def stop_tg_polling():
     _tg_polling_stop.set()
 
 
-def create_telegram_app():
-    app = Flask("telegram")
-
-    @app.route("/health")
-    def health():
-        return ok_response({
-            "service": "telegram", "status": "running",
-            "bot_configured": bool(config.telegram_bot_token),
-            "polling": _tg_polling_thread is not None and _tg_polling_thread.is_alive(),
-        })
-
-    @app.route("/send", methods=["POST"])
-    def send():
-        data = request.get_json(silent=True) or {}
-        tg_id = data.get("tg_user_id")
-        text = data.get("text", "")
-        if not tg_id or not text:
-            return fail_response("BAD_REQUEST", "tg_user_id and text required", 400)
-        result = tg_send_message(tg_id, text)
-        if result is None:
-            return fail_response("TELEGRAM_FAILED", "Failed to send Telegram message", 502)
-        return ok_response(result.get("result"))
-
-    @app.route("/notify-subscription", methods=["POST"])
-    def notify_subscription():
-        data = request.get_json(silent=True) or {}
-        tg_id = data.get("tg_user_id")
-        status = data.get("status")
-        plan_name = data.get("plan_name", "")
-        if not tg_id or status not in ("approved", "rejected"):
-            return fail_response("BAD_REQUEST", "tg_user_id + status (approved|rejected) required", 400)
-        if status == "approved":
-            text = (f"✅ <b>Payment Verified</b>\n\nYour payment has been verified and you've been "
-                    f"upgraded to the <b>{plan_name}</b> plan. Enjoy your new features!")
-        else:
-            text = (f"❌ <b>Payment Rejected</b>\n\nYour payment for the <b>{plan_name}</b> plan was "
-                    f"rejected. This is your final warning — please contact support for details.")
-        result = tg_send_message(tg_id, text)
-        if result is None:
-            return fail_response("TELEGRAM_FAILED", "Failed to send notification", 502)
-        return ok_response(result.get("result"))
-
-    return app
-
-
 # ============================================================================
-# 📈 SIGNALS SERVICE
+# 📈 SIGNALS — catalog + generator
 # ============================================================================
 STRATEGIES = {
     "strong": {"id": "strong", "name": "Strong", "color": "#00ff88", "winRate": 0.55,
@@ -394,8 +311,8 @@ STRATEGIES = {
 }
 
 _signals_lock = threading.Lock()
-_signals: list[dict] = []
-_running_strategies: set[str] = set(config.signal_strategies)
+_signals = []
+_running_strategies = set(config.signal_strategies)
 _sig_gen_thread = None
 _sig_gen_stop = threading.Event()
 
@@ -437,7 +354,6 @@ def _sig_gen_loop():
     next_signal_at = time.time()
     while not _sig_gen_stop.is_set():
         now = time.time()
-        # 1) Resolve expired signals
         with _signals_lock:
             for sig in _signals:
                 if sig["result"] is not None: continue
@@ -446,7 +362,6 @@ def _sig_gen_loop():
                     _resolve_signal(sig)
                     try: node_push_signal_resolve(sig["id"], sig["result"], sig["profit"])
                     except Exception as e: log_warn("signal resolve push failed", id=sig["id"], err=str(e))
-        # 2) Generate a new signal
         if now >= next_signal_at and _running_strategies:
             sig = _gen_signal()
             if sig:
@@ -473,116 +388,140 @@ def stop_sig_generator():
     _sig_gen_stop.set()
 
 
-def create_signals_app():
-    app = Flask("signals")
-
-    @app.route("/health")
-    def health():
-        with _signals_lock:
-            signals_count = len(_signals)
-            active = sum(1 for s in _signals if s["result"] is None)
-        return ok_response({
-            "service": "signals", "status": "running",
-            "generator_running": _sig_gen_thread is not None and _sig_gen_thread.is_alive(),
-            "running_strategies": list(_running_strategies),
-            "signals_buffered": signals_count, "signals_active": active,
-        })
-
-    @app.route("/signals")
-    def signals():
-        try: limit = int(request.args.get("limit", 50))
-        except ValueError: return fail_response("BAD_LIMIT", "limit must be an integer", 400)
-        limit = max(1, min(limit, 500))
-        with _signals_lock:
-            return ok_response([dict(s) for s in _signals[:limit]])
-
-    @app.route("/bot/status")
-    def bot_status():
-        with _signals_lock:
-            signals_count = len(_signals)
-            active = sum(1 for s in _signals if s["result"] is None)
-        return ok_response({
-            "running": bool(_running_strategies),
-            "strategies": [{**STRATEGIES[sid], "enabled": sid in _running_strategies} for sid in STRATEGIES],
-            "platforms": [{"id": "QUOTEX", "running": True}, {"id": "BINOLLA", "running": True}],
-            "signals_total": signals_count, "signals_active": active,
-        })
-
-    @app.route("/bot/control", methods=["POST"])
-    def bot_control():
-        data = request.get_json(silent=True) or {}
-        strategy = data.get("strategy")
-        action = data.get("action")
-        if strategy not in STRATEGIES:
-            return fail_response("BAD_STRATEGY", f"Unknown strategy: {strategy}", 400)
-        if action not in ("start", "stop"):
-            return fail_response("BAD_ACTION", "action must be 'start' or 'stop'", 400)
-        with _signals_lock:
-            if action == "start": _running_strategies.add(strategy)
-            else: _running_strategies.discard(strategy)
-        log_info("bot control", strategy=strategy, action=action, running=list(_running_strategies))
-        try: node_push_bot_status({"strategies": list(_running_strategies)})
-        except Exception: pass
-        return ok_response({"strategy": strategy, "action": action, "running_strategies": list(_running_strategies)})
-
-    return app
-
-
 # ============================================================================
-# 🌐 MAIN APP — unified health check on $PORT
+# FLASK APP — single app, single port, all routes
 # ============================================================================
-main_app = Flask("main")
+app = Flask(__name__)
 
 
-@main_app.route("/health")
-def main_health():
+# --- Root + health ---
+@app.route("/")
+def root():
+    return jsonify({"name": "QuantVexa Python Backend", "services": ["candle", "telegram", "signals"], "health": "/health"})
+
+
+@app.route("/health")
+def health():
+    with _signals_lock:
+        signals_count = len(_signals)
+        active = sum(1 for s in _signals if s["result"] is None)
     return jsonify({
         "ok": True, "service": "python-backend",
         "services": {
-            "candle":   {"port": config.port_candle,   "url": f"http://localhost:{config.port_candle}"},
-            "telegram": {"port": config.port_telegram, "url": f"http://localhost:{config.port_telegram}"},
-            "signals":  {"port": config.port_signals,  "url": f"http://localhost:{config.port_signals}"},
+            "candle":   {"routes": ["/candle/symbols", "/candle/candles/<symbol>"]},
+            "telegram": {"routes": ["/telegram/send", "/telegram/notify-subscription"], "polling": _tg_polling_thread is not None and _tg_polling_thread.is_alive()},
+            "signals":  {"routes": ["/signals/list", "/signals/bot/status", "/signals/bot/control"], "generator_running": _sig_gen_thread is not None and _sig_gen_thread.is_alive()},
         },
+        "signals_total": signals_count, "signals_active": active,
         "ts": int(time.time() * 1000),
     })
 
 
-@main_app.route("/")
-def main_root():
-    return jsonify({"name": "QuantVexa Python Backend", "services": ["candle", "telegram", "signals"], "health": "/health"})
+# ============================================================================
+# 🕯️ CANDLE ROUTES — /candle/*
+# ============================================================================
+@app.route("/candle/symbols")
+def candle_symbols():
+    return ok_response(SYMBOLS)
+
+
+@app.route("/candle/candles/<path:symbol>")
+def candle_candles(symbol):
+    timeframe = request.args.get("timeframe", "1m")
+    if timeframe not in TIMEFRAME_SECONDS:
+        return fail_response("BAD_TIMEFRAME", f"Unsupported timeframe: {timeframe}", 400)
+    try: limit = int(request.args.get("limit", config.candle_default_limit))
+    except ValueError: return fail_response("BAD_LIMIT", "limit must be an integer", 400)
+    limit = max(1, min(limit, 1000))
+    candles_data = _gen_candles(symbol, timeframe, limit)
+    log_info("candles served", symbol=symbol, timeframe=timeframe, count=len(candles_data))
+    return ok_response({"symbol": symbol, "timeframe": timeframe, "candles": candles_data})
 
 
 # ============================================================================
-# SERVER THREAD HELPER
+# 🤖 TELEGRAM ROUTES — /telegram/*
 # ============================================================================
-class ServerThread(threading.Thread):
-    def __init__(self, app, host, port, name):
-        super().__init__(name=name, daemon=True)
-        self.app = app; self.host = host; self.port = port; self.name = name; self.srv = None
+@app.route("/telegram/send", methods=["POST"])
+def telegram_send():
+    data = request.get_json(silent=True) or {}
+    tg_id = data.get("tg_user_id")
+    text = data.get("text", "")
+    if not tg_id or not text:
+        return fail_response("BAD_REQUEST", "tg_user_id and text required", 400)
+    result = tg_send_message(tg_id, text)
+    if result is None:
+        return fail_response("TELEGRAM_FAILED", "Failed to send Telegram message", 502)
+    return ok_response(result.get("result"))
 
-    def run(self):
-        self.srv = make_server(self.host, self.port, self.app, threaded=True)
-        log_info(f"{self.name} listening", host=self.host, port=self.port)
-        try: self.srv.serve_forever()
-        except Exception as e: log_error(f"{self.name} crashed", err=str(e))
 
-    def shutdown(self):
-        if self.srv: self.srv.shutdown()
+@app.route("/telegram/notify-subscription", methods=["POST"])
+def telegram_notify_subscription():
+    data = request.get_json(silent=True) or {}
+    tg_id = data.get("tg_user_id")
+    status = data.get("status")
+    plan_name = data.get("plan_name", "")
+    if not tg_id or status not in ("approved", "rejected"):
+        return fail_response("BAD_REQUEST", "tg_user_id + status (approved|rejected) required", 400)
+    if status == "approved":
+        text = (f"✅ <b>Payment Verified</b>\n\nYour payment has been verified and you've been "
+                f"upgraded to the <b>{plan_name}</b> plan. Enjoy your new features!")
+    else:
+        text = (f"❌ <b>Payment Rejected</b>\n\nYour payment for the <b>{plan_name}</b> plan was "
+                f"rejected. This is your final warning — please contact support for details.")
+    result = tg_send_message(tg_id, text)
+    if result is None:
+        return fail_response("TELEGRAM_FAILED", "Failed to send notification", 502)
+    return ok_response(result.get("result"))
 
 
 # ============================================================================
-# BOOT
+# 📈 SIGNALS ROUTES — /signals/*
+# ============================================================================
+@app.route("/signals/list")
+def signals_list():
+    try: limit = int(request.args.get("limit", 50))
+    except ValueError: return fail_response("BAD_LIMIT", "limit must be an integer", 400)
+    limit = max(1, min(limit, 500))
+    with _signals_lock:
+        return ok_response([dict(s) for s in _signals[:limit]])
+
+
+@app.route("/signals/bot/status")
+def signals_bot_status():
+    with _signals_lock:
+        signals_count = len(_signals)
+        active = sum(1 for s in _signals if s["result"] is None)
+    return ok_response({
+        "running": bool(_running_strategies),
+        "strategies": [{**STRATEGIES[sid], "enabled": sid in _running_strategies} for sid in STRATEGIES],
+        "platforms": [{"id": "QUOTEX", "running": True}, {"id": "BINOLLA", "running": True}],
+        "signals_total": signals_count, "signals_active": active,
+    })
+
+
+@app.route("/signals/bot/control", methods=["POST"])
+def signals_bot_control():
+    data = request.get_json(silent=True) or {}
+    strategy = data.get("strategy")
+    action = data.get("action")
+    if strategy not in STRATEGIES:
+        return fail_response("BAD_STRATEGY", f"Unknown strategy: {strategy}", 400)
+    if action not in ("start", "stop"):
+        return fail_response("BAD_ACTION", "action must be 'start' or 'stop'", 400)
+    with _signals_lock:
+        if action == "start": _running_strategies.add(strategy)
+        else: _running_strategies.discard(strategy)
+    log_info("bot control", strategy=strategy, action=action, running=list(_running_strategies))
+    try: node_push_bot_status({"strategies": list(_running_strategies)})
+    except Exception: pass
+    return ok_response({"strategy": strategy, "action": action, "running_strategies": list(_running_strategies)})
+
+
+# ============================================================================
+# BOOT — start background threads, gunicorn handles the HTTP server
 # ============================================================================
 def boot():
-    log_info("🚀 Python backend starting",
-             port=config.port, candle_port=config.port_candle,
-             telegram_port=config.port_telegram, signals_port=config.port_signals,
-             node_url=config.node_backend_url)
-
-    candle_thread   = ServerThread(create_candle_app(),   "0.0.0.0", config.port_candle,   "candle-svc")
-    telegram_thread = ServerThread(create_telegram_app(), "0.0.0.0", config.port_telegram, "telegram-svc")
-    signals_thread  = ServerThread(create_signals_app(),  "0.0.0.0", config.port_signals,  "signals-svc")
-    candle_thread.start(); telegram_thread.start(); signals_thread.start()
+    log_info("🚀 Python backend starting", port=config.port, node_url=config.node_backend_url)
 
     if config.telegram_bot_token:
         start_tg_polling()
@@ -595,22 +534,15 @@ def boot():
 
     def shutdown(*_):
         log_info("shutting down...")
-        stop_sig_generator(); stop_tg_polling()
-        candle_thread.shutdown(); telegram_thread.shutdown(); signals_thread.shutdown()
-        time.sleep(0.5); sys.exit(0)
+        stop_sig_generator()
+        stop_tg_polling()
+        time.sleep(0.5)
+        sys.exit(0)
 
     signal_module.signal(signal_module.SIGTERM, shutdown)
     signal_module.signal(signal_module.SIGINT, shutdown)
-    return shutdown
 
 
-# Gunicorn entry point — Railway's Procfile uses `main:app`.
-# Boot the 3 services the moment this module is imported.
-app = main_app
-_shutdown_fn = boot()
-
-
-if __name__ == "__main__":
-    # When run directly (no gunicorn), block on the main Flask app.
-    log_info(f"main app listening on :{config.port}")
-    run_simple("0.0.0.0", config.port, main_app, threaded=True)
+# Boot background threads at import time (works for both `python main.py`
+# and `gunicorn main:app`).
+boot()
