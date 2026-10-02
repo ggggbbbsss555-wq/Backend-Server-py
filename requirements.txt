@@ -1,0 +1,12 @@
+# Web framework for the 3 Flask services (candle, telegram, signals)
+Flask==3.0.3
+gunicorn==22.0.0
+
+# HTTP client for calling Node.js internal webhooks
+requests==2.32.3
+
+# Telegram Bot API
+python-telegram-bot==21.4
+
+# Environment variables
+python-dotenv==1.0.1
